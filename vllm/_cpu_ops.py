@@ -739,6 +739,12 @@ def fused_gdn_gating_cpu(
     )
 
 
+def has_causal_conv1d_kernels() -> bool:
+    """Whether this build has the C++ causal conv1d kernels, which Apple
+    Silicon builds leave out."""
+    return hasattr(torch.ops._C, "causal_conv1d_weight_pack")
+
+
 def causal_conv1d_weight_pack(
     weight: torch.Tensor,
 ) -> torch.Tensor:

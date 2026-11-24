@@ -129,9 +129,11 @@ def _causal_conv1d_update_cpu(
 
 
 def is_arm_bf16() -> bool:
+    """ARM with bf16 and the C++ causal conv1d kernels."""
     return (
         current_platform.get_cpu_architecture() == CpuArchEnum.ARM
         and torch.cpu.get_capabilities().get("bf16", False)
+        and ops.has_causal_conv1d_kernels()
     )
 
 

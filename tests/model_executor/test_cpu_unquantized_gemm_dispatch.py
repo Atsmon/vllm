@@ -10,12 +10,15 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 
-def test_dispatch_prepacks_arm_bf16_causal_conv(monkeypatch):
+@pytest.mark.parametrize("has_kernels", [True, False])
+def test_dispatch_prepacks_arm_bf16_causal_conv(monkeypatch, has_kernels):
     monkeypatch.setattr(
         current_platform, "get_cpu_architecture", lambda: CpuArchEnum.ARM
     )
     monkeypatch.setattr(torch.cpu, "get_capabilities", lambda: {"bf16": True})
     monkeypatch.setattr(torch.cpu, "_is_avx512_bf16_supported", lambda: False)
+    # Apple Silicon builds have no conv kernels to pack the weight for.
+    monkeypatch.setattr(utils.cpu_ops, "has_causal_conv1d_kernels", lambda: has_kernels)
 
     packed = torch.randn(32, 4, dtype=torch.bfloat16)
     pack_inputs = []
@@ -31,6 +34,10 @@ def test_dispatch_prepacks_arm_bf16_causal_conv(monkeypatch):
 
     utils.dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
 
+    if not has_kernels:
+        assert not pack_inputs
+        torch.testing.assert_close(layer.weight, original)
+        return
     assert len(pack_inputs) == 1
     # Check causal_conv1d_weight_pack received the expected weights
     torch.testing.assert_close(pack_inputs[0], original.view(32, 4))
