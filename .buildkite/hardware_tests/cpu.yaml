@@ -12,6 +12,7 @@ steps:
   - CMakeLists.txt
   - vllm/_custom_ops.py
   - vllm/_cpu_ops.py
+  - vllm/v1/attention/backends/cpu_attn.py
   - tests/kernels/attention/test_cpu_attn.py
   - tests/v1/attention/test_group_head_counts.py
   - tests/kernels/attention/test_amx_mla.py

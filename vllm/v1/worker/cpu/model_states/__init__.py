@@ -23,12 +23,17 @@ def init_model_state(
 def resolve_model_state_cls(
     vllm_config: VllmConfig, model: nn.Module
 ) -> type[ModelState]:
-    # Custom model states are GPU-owned until a CPU implementation is provided.
-    if hasattr(model, "get_model_state_cls"):
-        raise ValueError(
-            f"Custom model state from {type(model).__name__} is not supported "
-            "by CPU Model Runner V2 without Triton."
-        )
+    # A model's own ModelState is used when it is a CPU one; GPU-only states
+    # (e.g. DiffusionGemma, LongCat n-gram) are refused.
+    get_model_state_cls = getattr(model, "get_model_state_cls", None)
+    if get_model_state_cls is not None:
+        cls = get_model_state_cls()
+        if not issubclass(cls, ModelState):
+            raise ValueError(
+                f"Custom model state from {type(model).__name__} is not supported "
+                "by CPU Model Runner V2 without Triton."
+            )
+        return cls
 
     # Cross-attention encoder-decoder models (Whisper, CohereASR, ...).
     if any(isinstance(module, CrossAttention) for module in model.modules()):

@@ -1707,3 +1707,89 @@ def test_cpu_mla_rejects_quantized_kv_cache() -> None:
     assert "MLA" in _select_attn_backend("auto", use_mla=True)
     with pytest.raises(ValueError, match="fp8"):
         _select_attn_backend("fp8", use_mla=True)
+
+
+def ref_range_mask(
+    n: int, ranges: list[tuple[int, int]], window: int | None, clamp: bool
+) -> torch.Tensor:
+    """Triton attention's mask, one entry at a time."""
+    mask = torch.zeros(n, n, dtype=torch.bool)
+    for q in range(n):
+        for k in range(n):
+            in_window = window is None or q - k < window
+            in_range = any(s <= q <= e and s <= k <= e for s, e in ranges)
+            mask[q, k] = (k <= q and in_window) or (
+                in_range and (in_window or not clamp)
+            )
+    return mask
+
+
+@pytest.mark.parametrize("window,clamp", [(None, False), (3, False), (3, True)])
+@torch.inference_mode()
+def test_decoder_attention_reads_bidirectional_ranges(
+    window: int | None, clamp: bool
+) -> None:
+    """A prefill's bidirectional ranges widen its causal (and windowed) mask."""
+    set_random_seed(0)
+    seq_lens = [5, 8]
+    ranges = {1: [(0, 3), (4, 7)]}
+    num_heads, num_kv_heads, head_size = 4, 2, 128
+    block_size = 128
+    dtype = torch.float32
+    device = torch.device("cpu")
+    layer_name = "model.layers.0.self_attn.attn"
+    vllm_config = create_vllm_config(dtype=dtype, block_size=block_size)
+
+    with set_current_vllm_config(vllm_config):
+        layer = Attention(
+            num_heads,
+            head_size,
+            head_size**-0.5,
+            num_kv_heads=num_kv_heads,
+            per_layer_sliding_window=window,
+            prefix=layer_name,
+            mm_prefix_clamp_sliding_window=clamp,
+        )
+        spec = AttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+        )
+        builder = layer.get_attn_backend().get_builder_cls()(
+            spec, [layer_name], vllm_config, device
+        )
+        common_attn_metadata = create_common_attn_metadata(
+            BatchSpec(seq_lens=seq_lens, query_lens=seq_lens),
+            block_size,
+            device,
+            arange_block_indices=True,
+        )
+        common_attn_metadata.mm_req_doc_ranges = ranges
+        attn_metadata = builder.build(0, common_attn_metadata)
+
+        num_tokens = sum(seq_lens)
+        query = torch.randn(num_tokens, num_heads, head_size, dtype=dtype)
+        key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=dtype)
+        value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=dtype)
+        kv_cache = torch.zeros(
+            len(seq_lens), num_kv_heads, block_size, 2 * head_size, dtype=dtype
+        )
+        layer.impl.do_kv_cache_update(
+            layer, key, value, kv_cache, common_attn_metadata.slot_mapping
+        )
+        output = torch.empty_like(query)
+        layer.impl.forward(layer, query, key, value, kv_cache, attn_metadata, output)
+
+    start = 0
+    for i, seq_len in enumerate(seq_lens):
+        end = start + seq_len
+        q, k, v = (t[start:end].transpose(0, 1) for t in (query, key, value))
+        k, v = (t.repeat_interleave(num_heads // num_kv_heads, 0) for t in (k, v))
+        mask = ref_range_mask(seq_len, ranges.get(i, []), window, clamp)
+        scores = (q @ k.transpose(1, 2) * head_size**-0.5).masked_fill(
+            ~mask, float("-inf")
+        )
+        expected = (scores.softmax(-1) @ v).transpose(0, 1)
+        torch.testing.assert_close(output[start:end], expected, atol=1e-4, rtol=1e-4)
+        start = end

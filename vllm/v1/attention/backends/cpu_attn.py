@@ -126,6 +126,8 @@ class CPUAttentionMetadata:
     scheduler_metadata: torch.Tensor | None
     causal: bool = True
     dynamic_causal: torch.Tensor | None = None
+    # Bidirectional token ranges of a request, by its batch index.
+    bidirectional_ranges: dict[int, list[tuple[int, int]]] | None = None
 
     # can be removed after deprecate sdpa
     use_sdpa_prefill: bool = False
@@ -287,6 +289,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             causal=causal,
             encoder_cache=encoder_cache_tensor,
             dynamic_causal=dynamic_casual,
+            bidirectional_ranges=common_attn_metadata.mm_req_doc_ranges,
         )
 
         return attn_metadata
@@ -465,8 +468,77 @@ class CPUAttentionBackendImpl(AttentionImpl):
             v_scale=layer._v_scale_float,
             kv_cache_dtype=self.kv_cache_dtype,
         )
+        if (
+            attn_metadata.bidirectional_ranges
+            and attn_metadata.causal
+            and self.attn_type == AttentionType.DECODER
+        ):
+            self._attend_bidirectional_ranges(
+                layer, query, key, value, output, attn_metadata
+            )
 
         return output
+
+    def _attend_bidirectional_ranges(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        output: torch.Tensor,
+        attn_metadata: CPUAttentionMetadata,
+    ) -> None:
+        """Recomputes the requests with queries in a bidirectional range.
+
+        The mask matches Triton attention's: (causal AND sliding window) OR
+        within one range, with the range kept in the window when the layer
+        clamps it. Only this step's keys are read, so a request whose prefill
+        resumes after cached tokens keeps the causal result.
+        """
+        assert attn_metadata.bidirectional_ranges is not None
+        query_start_loc = attn_metadata.query_start_loc.tolist()
+        seq_lens = attn_metadata.seq_lens.tolist()
+        clamp = getattr(layer, "mm_prefix_clamp_sliding_window", False)
+        for req, ranges in attn_metadata.bidirectional_ranges.items():
+            start, end = query_start_loc[req], query_start_loc[req + 1]
+            context_len = seq_lens[req] - (end - start)
+            ranges = [(s, e) for s, e in ranges if s < e and e >= context_len]
+            if not ranges:
+                continue
+            if (
+                context_len > 0
+                or key is None
+                or value is None
+                or self.alibi_slopes is not None
+                or self.logits_soft_cap
+                or self.sinks is not None
+            ):
+                logger.warning_once(
+                    "CPU_ATTN reads bidirectional ranges only for a prefill "
+                    "from the first token without ALiBi, softcap or sinks; "
+                    "other requests attend causally"
+                )
+                continue
+            positions = torch.arange(end - start)
+            distance = positions[:, None] - positions[None, :]
+            in_window = distance < (
+                self.sliding_window if self.sliding_window > 0 else end - start
+            )
+            mask = (distance >= 0) & in_window
+            for s, e in ranges:
+                inside = (positions >= s) & (positions <= e)
+                in_range = inside[:, None] & inside[None, :]
+                mask |= in_range & in_window if clamp else in_range
+            out = torch.nn.functional.scaled_dot_product_attention(
+                query[start:end].transpose(0, 1),
+                key[start:end].transpose(0, 1),
+                value[start:end].transpose(0, 1),
+                attn_mask=mask,
+                scale=self.scale,
+                enable_gqa=self.num_queries_per_kv > 1,
+            )
+            req_output = output[start:end]
+            req_output.copy_(out.transpose(0, 1).reshape(req_output.shape))
 
     def do_kv_cache_update(
         self,

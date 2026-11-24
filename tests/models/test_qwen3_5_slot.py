@@ -10,10 +10,17 @@ from transformers.models.qwen3_5 import Qwen3_5Config
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
-from vllm.model_executor.models.qwen3_5_slot import Qwen3_5SlotDecisionModelState
+from vllm.model_executor.models.qwen3_5_slot import (
+    Qwen3_5SlotDecisionCPUModelState,
+    Qwen3_5SlotDecisionModelState,
+)
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.sched.prefix_lm_scheduler import PREFIX_LM_LEN
+from vllm.v1.worker.cpu.model_states.mamba_hybrid import (
+    MambaHybridModelState as CPUMambaHybridModelState,
+)
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 pytestmark = pytest.mark.cpu_test
@@ -43,6 +50,14 @@ def gdn_prefill_backend(monkeypatch):
         lambda vllm_config: ("auto", backend["name"]),
     )
     return backend
+
+
+@pytest.fixture(autouse=True)
+def cpu_platform(monkeypatch):
+    """Configure for a GPU, unless a test sets "cpu"."""
+    platform = {"cpu": False}
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: platform["cpu"])
+    return platform
 
 
 def make_vllm_config(
@@ -162,6 +177,14 @@ def test_config_rejects_unsupported_features(tmp_path, engine_args, match):
         make_vllm_config(tmp_path, **engine_args)
 
 
+def test_config_uses_cpu_attention_on_cpu(tmp_path, cpu_platform):
+    cpu_platform["cpu"] = True
+    config = make_vllm_config(tmp_path)
+    assert config.attention_config.backend == AttentionBackendEnum.CPU_ATTN
+    with pytest.raises(ValueError, match="CPU_ATTN attention backend"):
+        make_vllm_config(tmp_path, attention_backend="TRITON_ATTN")
+
+
 @pytest.mark.parametrize("budget,expected", [(8192, 32768), (33024, 33024)])
 def test_config_raises_a_budget_below_max_model_len(tmp_path, budget, expected):
     config = make_vllm_config(
@@ -170,10 +193,11 @@ def test_config_raises_a_budget_below_max_model_len(tmp_path, budget, expected):
     assert config.scheduler_config.max_num_batched_tokens == expected
 
 
-def make_model_state(monkeypatch):
-    monkeypatch.setattr(MambaHybridModelState, "add_request", lambda *args: None)
-    monkeypatch.setattr(MambaHybridModelState, "remove_request", lambda *args: None)
-    state = object.__new__(Qwen3_5SlotDecisionModelState)
+def make_model_state(monkeypatch, cls=Qwen3_5SlotDecisionModelState):
+    for base in (MambaHybridModelState, CPUMambaHybridModelState):
+        monkeypatch.setattr(base, "add_request", lambda *args: None)
+        monkeypatch.setattr(base, "remove_request", lambda *args: None)
+    state = object.__new__(cls)
     state.blocks = {}
 
     def add(req_id, prefix_len, mm_features=()):
@@ -235,3 +259,14 @@ def test_model_state_refuses_a_step_inside_a_block(monkeypatch):
     add("a", 4)
     with pytest.raises(RuntimeError, match="inside one of its blocks"):
         state._block_ranges(make_batch(["a"], [0], [6]))
+
+
+def test_cpu_model_state_ranges(monkeypatch):
+    state, add = make_model_state(monkeypatch, Qwen3_5SlotDecisionCPUModelState)
+    add("a", 4)
+    add("causal", None)
+    batch = make_batch(["causal", "a"], [10, 0], [1, 10])
+    assert state._block_ranges(batch) == {1: [(0, 3), (4, 9)]}
+    # A question prefilled after a cached prefix has keys CPU attention lacks.
+    with pytest.raises(RuntimeError, match="resumes its prefill"):
+        state._block_ranges(make_batch(["a"], [4], [6]))
