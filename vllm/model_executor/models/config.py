@@ -1832,17 +1832,23 @@ class Qwen3_5ForSlotDecisionConfig(Qwen3_5ForConditionalGenerationConfig):
                 f"{model_config.architecture} does not support {', '.join(features)}"
             )
 
-        # Triton attention applies the PrefixLM ranges to every request. A
-        # per-kind backend wins over the global one, as in the selector.
+        # Triton attention, or CPU attention on CPU, applies the PrefixLM
+        # ranges to every request. A per-kind backend wins over the global
+        # one, as in the selector.
+        needed = (
+            AttentionBackendEnum.CPU_ATTN
+            if current_platform.is_cpu()
+            else AttentionBackendEnum.TRITON_ATTN
+        )
         attention_config = vllm_config.attention_config
         if attention_config.backend is None:
-            attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+            attention_config.backend = needed
         backend = attention_config.backend_per_kind.get(
             "full_attention", attention_config.backend
         )
-        if backend != AttentionBackendEnum.TRITON_ATTN:
+        if backend != needed:
             raise ValueError(
-                f"{model_config.architecture} needs the TRITON_ATTN attention "
+                f"{model_config.architecture} needs the {needed.name} attention "
                 f"backend for full attention, not {backend.name}"
             )
 

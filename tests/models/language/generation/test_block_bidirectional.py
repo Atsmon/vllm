@@ -19,10 +19,13 @@ ATOL = 0.1
 
 pytestmark = [
     pytest.mark.hybrid_model,
+    pytest.mark.cpu_model,
     pytest.mark.skipif(
-        not current_platform.is_cuda(), reason="block attention needs a CUDA GPU"
+        not (current_platform.is_cuda() or current_platform.is_cpu()),
+        reason="block attention needs a CUDA GPU or the CPU backend",
     ),
 ]
+DEVICE = "cuda" if current_platform.is_cuda() else "cpu"
 
 
 def build_tiny_checkpoint(path: str) -> None:
@@ -62,15 +65,15 @@ def hf_logprobs(path: str, prompts: dict, prefix_len: int) -> list[dict]:
 
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
         path, dtype=torch.float32, attn_implementation="sdpa"
-    ).to("cuda")
+    ).to(DEVICE)
     mask = hf.create_causal_mask
 
     def run(prompt: list[int], blocked: bool) -> torch.Tensor:
-        ids = (torch.arange(len(prompt), device="cuda") >= prefix_len).long()[None]
+        ids = (torch.arange(len(prompt), device=DEVICE) >= prefix_len).long()[None]
         patched = partial(mask, block_sequence_ids=ids if blocked else None)
         monkeypatch.setattr(hf, "create_causal_mask", patched)
         with torch.inference_mode():
-            logits = model(input_ids=torch.tensor([prompt], device="cuda")).logits
+            logits = model(input_ids=torch.tensor([prompt], device=DEVICE)).logits
         return torch.log_softmax(logits[0, -1].float(), -1)[:NUM_SCORED].cpu()
 
     with pytest.MonkeyPatch.context() as monkeypatch:
@@ -99,7 +102,8 @@ def test_block_attention_matches_transformers(vllm_runner, tmp_path, enforce_eag
     }
     p = len(prefix)
     expected, causal = hf_logprobs(checkpoint, questions, p)
-    torch.accelerator.empty_cache()
+    if current_platform.is_cuda():
+        torch.accelerator.empty_cache()
     for q in questions:
         # The mask must matter, or the comparison proves nothing.
         assert (causal[q] - expected[q]).abs().max() > 5 * ATOL, q

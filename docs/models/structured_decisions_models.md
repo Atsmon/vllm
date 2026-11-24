@@ -420,10 +420,10 @@ vllm serve baselabs/mammoth-1
   backends.
 - A `choice` can have up to 255 options, labeled `A` to `Z` and then with
   two-letter labels in the prompt. Media inputs return 400.
-- Only the `TRITON_ATTN` attention backend is supported, and it is selected
-  automatically. KV transfer connectors, `--kv-offloading-size`, speculative
-  decoding, context parallelism, micro-batching, `--prefix-match-unit` and
-  `--scheduler-cls` are refused.
+- Only the `TRITON_ATTN` attention backend is supported, or `CPU_ATTN` on
+  CPU, and it is selected automatically. KV transfer connectors,
+  `--kv-offloading-size`, speculative decoding, context parallelism,
+  micro-batching, `--prefix-match-unit` and `--scheduler-cls` are refused.
 - `instructions` returns 400, as does any `chat_template_kwargs` other than
   `{"enable_thinking": false}`. `/v1/decisions` reads every question as a
   choice and returns 400 for score levels with the same label.
